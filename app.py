@@ -1,5 +1,5 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
@@ -16,7 +16,7 @@ st.title("🧑‍⚕️ Face to BMI 智能預測系統")
 st.write("請拍攝或上傳一張**正臉半身照**，系統將透過 AI 模型的臉部特徵估算 BMI。")
 
 # ==========================================
-# 1. 模型載入設定 (請根據你訓練時的模型架構修改)
+# 1. 模型載入設定 (請根據你訓練時的模型架換修改)
 # ==========================================
 MODEL_URL = "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold1_latest.pth"
 MODEL_PATH = "fold1_latest.pth"
@@ -24,7 +24,6 @@ MODEL_PATH = "fold1_latest.pth"
 @st.cache_resource
 def load_bmi_model():
     # 這裡假設你的模型是 ResNet18 用於迴歸任務 (輸出 1 個 BMI 值)
-    # 如果你是用其他架構 (如 EfficientNet)，請在此處更換
     model = resnet18(pretrained=False)
     model.fc = nn.Linear(model.fc.in_features, 1) 
     
@@ -62,13 +61,14 @@ def predict_bmi(image):
     return bmi_val
 
 # ==========================================
-# 2. 視訊串流與動態虛線框 (WebRTC)
+# 2. 新版視訊串流與動態虛線框 (使用 VideoProcessorBase)
 # ==========================================
-class FaceBoxTransformer(VideoTransformerBase):
+class FaceBoxProcessor(VideoProcessorBase):
     def __init__(self):
         self.latest_frame = None
 
     def recv(self, frame):
+        # 轉換為 ndarray (BGR 格式)
         img = frame.to_ndarray(format="bgr24")
         h, w, _ = img.shape
         
@@ -80,11 +80,11 @@ class FaceBoxTransformer(VideoTransformerBase):
         x1, y1 = int((w - box_w) / 2), int((h - box_h) / 4)
         x2, y2 = x1 + box_w, y1 + box_h
 
-        # 繪製橢圓形或矩形虛線框 (OpenCV 無內建虛線，用畫點/線段模擬)
+        # 繪製黃色虛線框
         color = (0, 255, 255) # 黃色
         thickness = 2
         
-        # 畫水平與垂直的虛線矩形
+        # 模擬虛線
         for i in range(x1, x2, 15):
             cv2.line(img, (i, y1), (min(i + 8, x2), y1), color, thickness)
             cv2.line(img, (i, y2), (min(i + 8, x2), y2), color, thickness)
@@ -107,27 +107,27 @@ if app_mode == "即時動態拍照":
     st.subheader("📷 鏡頭動態捕捉")
     st.info("請將頭部與雙肩對齊畫面中的黃色虛線框。")
     
-    # 啟動 WebRTC 串流
+    # 啟動 WebRTC 串流 (更新為 video_processor_factory)
     ctx = webrtc_streamer(
         key="face2bmi-stream",
         mode=WebRtcMode.SENDRECV,
-        video_transformer_factory=FaceBoxTransformer,
+        video_processor_factory=FaceBoxProcessor,
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
 
-    # 拍照按鈕
-    if ctx.video_transformer:
+    # 拍照按鈕 (更新為 ctx.video_processor)
+    if ctx.video_processor:
         if st.button("📸 擷取畫面並預測"):
-            raw_img = ctx.video_transformer.latest_frame
+            raw_img = ctx.video_processor.latest_frame
             if raw_img is not None:
                 # 轉換為 RGB 與 PIL 格式
                 raw_rgb = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(raw_rgb)
                 
                 # 顯示拍到的照片
-                st.image(pil_img, caption="已擷取的照片 (已自動去除提示框)", use_column_width=True)
+                st.image(pil_img, caption="已擷取的照片 (已自動去除提示框)", use_container_width=True)
                 
                 # 預測
                 with st.spinner("AI 計算中..."):
@@ -146,7 +146,7 @@ if app_mode == "即時動態拍照":
                 else:
                     st.error("評估結果：肥胖。建議搭配運動與專業醫療諮詢。")
             else:
-                st.error("無法讀取鏡頭畫面，請確認鏡頭已正常啟動。")
+                st.error("視訊暫存中尚未捕捉到影格，請稍候片刻並重試。")
 
 elif app_mode == "上傳本機照片":
     st.subheader("📤 上傳半身照片")
@@ -154,7 +154,7 @@ elif app_mode == "上傳本機照片":
     
     if uploaded_file is not None:
         image = Image.open(uploaded_file).convert("RGB")
-        st.image(image, caption="已上傳的照片", use_column_width=True)
+        st.image(image, caption="已上傳的照片", use_container_width=True)
         
         if st.button("🚀 開始分析 BMI"):
             with st.spinner("AI 進行特徵分析中..."):
