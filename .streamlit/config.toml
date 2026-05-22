@@ -1,2 +1,15 @@
 [client]
+# 關鍵防禦：當程式噴錯時，隱藏詳細的程式碼路徑與錯誤細節，防止使用者看到你的後台結構
+showErrorDetails = false
+
+# 終極防禦：直接將工具列設為 minimal，這會自動拔除右上角所有選單（包含 View app source）
 toolbarMode = "minimal"
+
+[server]
+# 效能優化：限制檔案上傳的最大容量為 10MB（車牌照片綽綽有餘）
+# 防止惡意使用者上傳幾百 MB 的巨型影片，直接瞬間擠爆你珍貴的伺服器記憶體
+maxUploadSize = 10
+
+# 效能優化：啟用安全防護與通訊優化
+enableCORS = false
+enableXsrfProtection = true
