@@ -25,11 +25,11 @@ WEIGHTS_DIR = "weights"
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 
 MODEL_URLS = {
-    1: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/untagged-7acc0ff91d2d03279e46/fold1_best.pth",
-    2: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/untagged-7acc0ff91d2d03279e46/fold2_best.pth",
-    3: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/untagged-7acc0ff91d2d03279e46/fold3_best.pth",
-    4: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/untagged-7acc0ff91d2d03279e46/fold4_best.pth",
-    5: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/untagged-7acc0ff91d2d03279e46/fold5_best.pth"
+    1: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold1_best.pth",
+    2: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold2_best.pth",
+    3: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold3_best.pth",
+    4: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold4_best.pth",
+    5: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold5_best.pth"
 }
 
 FOLD_PATHS = [os.path.join(WEIGHTS_DIR, f"fold{i}_best.pth") for i in range(1, 6)]
