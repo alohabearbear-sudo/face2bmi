@@ -63,7 +63,6 @@ def get_ensemble_models():
                 model = resnet18(pretrained=False)
                 model.fc = nn.Linear(model.fc.in_features, 1)
                 
-                # ✨ 關鍵安全降級載入：避免新舊版本 PyTorch 對齊封鎖
                 try:
                     state_dict = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
                 except Exception:
@@ -76,7 +75,7 @@ def get_ensemble_models():
             _models_ensemble = loaded_models
     return _models_ensemble
 
-# 影像預處理流程 (確保與訓練時的 input size 及 normalization 完全契合)
+# 影像預處理流程
 img_transforms = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -101,7 +100,7 @@ def process_face_bmi(img_np):
 
     def draw_dashed_line(img, pt1, pt2, gap=12):
         dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
-        if dist == Dist == 0: return
+        if dist == 0: return  # ✨ 這裡已修正！
         pts = np.linspace(pt1, pt2, max(2, int(dist / gap)))
         for i in range(0, len(pts) - 1, 2):
             cv2.line(img, tuple(pts[i].astype(int)), tuple(pts[i+1].astype(int)), color, thickness)
@@ -135,7 +134,7 @@ def process_face_bmi(img_np):
                 fold_bmi = float(output.item())
                 bmi_outputs.append(fold_bmi)
                 
-                # 依據折預測結果投票
+                # 依據預測結果投票
                 fold_gender = "Male (男性)" if fold_bmi > 24.2 else "Female (女性)"
                 gender_votes.append(fold_gender)
         
@@ -154,7 +153,6 @@ def process_face_bmi(img_np):
             status_res = "🔴 肥胖體態"
 
     except Exception as e:
-        # ✨ 如果出錯，直接把詳細報錯資訊噴在畫面上，不進行無聲隱藏！
         bmi_val = 0.0
         gender_res = "Error"
         status_res = f"❌ 核心辨識異常: {str(e)}"
@@ -184,7 +182,7 @@ if input_mode == "📤 上傳本機照片":
     target_image = st.file_uploader(
         "選擇本機相簿中的正臉半身照片",
         type=["jpg", "jpeg", "png"],
-        key="bmi_uploader_final_v4"
+        key="bmi_uploader_final_v5"
     )
 else:
     target_image = st.camera_input("請將正臉與肩膀對齊畫面中央進行拍攝")
@@ -237,8 +235,8 @@ else:
     with col_left:
         st.info("💡 請上傳照片或開啟鏡頭拍照，系統將自動啟動 5-Fold AI 交叉預估。")
     with col_right:
-        st.text_input("📊 多數決預估性別", value="等待輸入...", disabled=True, key="dis_gender_final_v4")
-        st.text_input("🩺 體態評估狀態", value="等待輸入...", disabled=True, key="dis_status_final_v4")
+        st.text_input("📊 多數決預估性別", value="等待輸入...", disabled=True, key="dis_gender_final_v5")
+        st.text_input("🩺 體態評估狀態", value="等待輸入...", disabled=True, key="dis_status_final_v5")
         st.subheader("🎯 5-Fold 平均 BMI 值")
         st.metric(label="Ensemble Average BMI", value="0.00")
 
