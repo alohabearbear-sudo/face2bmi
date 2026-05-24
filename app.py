@@ -10,7 +10,6 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 import timm
 from PIL import Image, ImageOps
-from collections import Counter
 
 # --- 0. Streamlit 網頁基本配置 ---
 st.set_page_config(
@@ -19,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# --- 1. 設定 5-Fold 下載網址與本地路徑 ---
+# --- 1. 下載設定 ---
 WEIGHTS_DIR = "weights"
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 
@@ -30,21 +29,20 @@ MODEL_URLS = {
     4: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold4_best.pth",
     5: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold5_best.pth",
 }
-
 FOLD_PATHS = [os.path.join(WEIGHTS_DIR, f"fold{i}_best.pth") for i in range(1, 6)]
 
-# --- 訓練時 BMI 標準化參數（反歸一化用）---
+# 訓練時 BMI 標準化參數（meta=0 時有效）
 BMI_MEAN = 24.5
 BMI_STD  = 4.5
 
 
-# --- 2. 正確的模型架構（對應 state_dict）---
+# --- 2. 正確模型架構 ---
 class FaceBMIModel(nn.Module):
     """
-    Backbone : EfficientNet-B3 (timm) → 1536-dim feature
-    meta_encoder : gender scalar (0/1) → 64-dim
-    bmi_head    : [1536 + 64 = 1600] → 512 → 256 → 1  (BMI regression)
-    gender_head : [1536] → 128 → 1  (gender binary logit)
+    Backbone : EfficientNet-B3 → 1536-dim
+    meta_encoder : gender scalar (0=Female / 1=Male) → 64-dim
+    bmi_head     : [1536+64=1600] → 1  (標準化 BMI)
+    gender_head  : [1536] → 1  (未學好，不使用)
     """
     def __init__(self):
         super().__init__()
@@ -53,36 +51,23 @@ class FaceBMIModel(nn.Module):
             num_classes=0, global_pool='avg'
         )
         self.meta_encoder = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 64),
+            nn.Linear(1, 64), nn.BatchNorm1d(64), nn.ReLU(),
+            nn.Dropout(0.3), nn.Linear(64, 64),
         )
         self.bmi_head = nn.Sequential(
-            nn.Linear(1600, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Linear(1600, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.3),
             nn.Linear(256, 1),
         )
         self.gender_head = nn.Sequential(
-            nn.Linear(1536, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1),
+            nn.Linear(1536, 128), nn.ReLU(), nn.Dropout(0.3), nn.Linear(128, 1),
         )
 
     def forward(self, x, meta):
-        feat        = self.backbone(x)                          # [B, 1536]
-        meta_feat   = self.meta_encoder(meta)                   # [B, 64]
-        combined    = torch.cat([feat, meta_feat], dim=1)       # [B, 1600]
-        bmi_norm    = self.bmi_head(combined)                   # [B, 1]
-        gender_logit = self.gender_head(feat)                   # [B, 1]
+        feat         = self.backbone(x)
+        meta_feat    = self.meta_encoder(meta)
+        bmi_norm     = self.bmi_head(torch.cat([feat, meta_feat], dim=1))
+        gender_logit = self.gender_head(feat)
         return bmi_norm, gender_logit
 
 
@@ -109,16 +94,15 @@ def get_ensemble_models():
     if not _models_ensemble:
         for i in range(1, 6):
             download_public_weights(i)
-
         with st.spinner("⏳ 載入 5-Fold EfficientNet-B3 Ensemble..."):
             loaded = []
             for path in FOLD_PATHS:
                 model = FaceBMIModel()
                 try:
-                    state_dict = torch.load(path, map_location='cpu', weights_only=False)
+                    sd = torch.load(path, map_location='cpu', weights_only=False)
                 except Exception:
-                    state_dict = torch.load(path, map_location='cpu')
-                model.load_state_dict(state_dict, strict=True)   # strict=True 確保完整載入
+                    sd = torch.load(path, map_location='cpu')
+                model.load_state_dict(sd, strict=True)
                 model.eval()
                 loaded.append(model)
             _models_ensemble = loaded
@@ -134,15 +118,16 @@ img_transforms = transforms.Compose([
 ])
 
 
-# --- 6. 核心推理邏輯 ---
-def process_face_bmi(img_np):
+# --- 6. 核心推理 ---
+def process_face_bmi(img_np, gender_val: float):
+    """
+    gender_val : 0.0 = Female, 1.0 = Male（由使用者選擇）
+    """
     if img_np is None:
-        return None, "等待輸入...", 0.0, "等待輸入..."
+        return None, 0.0, "等待輸入..."
 
     h, w = img_np.shape[:2]
-    draw_img = img_np.copy()
-
-    # 繪製對齊虛線框（與原版相同）
+    draw_img  = img_np.copy()
     cx, cy    = int(w * 0.5), int(h * 0.45)
     color     = (0, 255, 255)
     thickness = max(2, int(w * 0.005))
@@ -169,7 +154,6 @@ def process_face_bmi(img_np):
     draw_dashed_line(draw_img,
                      (cx + int(w * 0.05), cy + int(h * 0.15)),
                      (cx + int(w * 0.05), cy + int(h * 0.2)), gap=8)
-
     shoulder_y = cy + int(h * 0.2)
     draw_dashed_ellipse(draw_img,
                         (cx - int(w * 0.22), shoulder_y + int(h * 0.1)),
@@ -185,35 +169,19 @@ def process_face_bmi(img_np):
                      (cx + int(w * 0.22), h))
 
     try:
-        models = get_ensemble_models()
-        pil_img   = Image.fromarray(img_np).convert('RGB')
-        img_tensor = img_transforms(pil_img).unsqueeze(0)  # [1, 3, 224, 224]
+        models     = get_ensemble_models()
+        pil_img    = Image.fromarray(img_np).convert('RGB')
+        img_tensor = img_transforms(pil_img).unsqueeze(0)
+        meta       = torch.tensor([[gender_val]])
 
-        bmi_raw_list    = []
-        gender_prob_list = []
-
+        bmi_raw_list = []
         with torch.no_grad():
-            # --- 第一輪：用 meta=0.0 取得 gender logit ---
-            meta_neutral = torch.tensor([[0.0]])
             for model in models:
-                _, gender_logit = model(img_tensor, meta_neutral)
-                gender_prob_list.append(torch.sigmoid(gender_logit).item())
-
-            # --- 決定性別（多數決）---
-            # sigmoid >= 0.5 → Male(1), < 0.5 → Female(0)
-            gender_votes = [1 if p >= 0.5 else 0 for p in gender_prob_list]
-            gender_val   = float(Counter(gender_votes).most_common(1)[0][0])
-            gender_res   = "Male (男性)" if gender_val == 1.0 else "Female (女性)"
-
-            # --- 第二輪：用確定的 gender 值取得精準 BMI ---
-            meta_final = torch.tensor([[gender_val]])
-            for model in models:
-                bmi_norm, _ = model(img_tensor, meta_final)
+                bmi_norm, _ = model(img_tensor, meta)
                 bmi_raw_list.append(bmi_norm.item())
 
-        # --- 反歸一化：BMI_real = raw * std + mean ---
+        # 反歸一化（僅對 Female meta=0 校準）
         bmi_val = float(np.mean(bmi_raw_list)) * BMI_STD + BMI_MEAN
-        # 合理範圍夾緊
         bmi_val = float(np.clip(bmi_val, 10.0, 60.0))
 
         if bmi_val < 18.5:
@@ -227,16 +195,15 @@ def process_face_bmi(img_np):
 
     except Exception as e:
         bmi_val    = -1.0
-        gender_res = "Error"
         status_res = f"❌ 核心辨識異常: {str(e)}"
         st.error(f"🚨 模型運算發生錯誤：\n{traceback.format_exc()}")
     finally:
         gc.collect()
 
-    return draw_img, gender_res, bmi_val, status_res
+    return draw_img, bmi_val, status_res
 
 
-# --- 7. 前端 CSS ---
+# --- 7. CSS ---
 st.markdown("""
 <style>
     .stMarkdown h1 { color: #2E7D32; text-align: center; font-weight: bold; }
@@ -244,9 +211,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 8. UI 介面（與原版相同）---
+# --- 8. UI ---
 st.markdown("# 🧑‍⚕️ AI 臉部即時 BMI & 性別估算系統 by Jimmy Chen")
 st.markdown("### 🎯 5-Fold 交叉驗證 Ensemble 統合（EfficientNet-B3 雙輸出頭版）")
+
+# 性別選擇（meta 輸入）
+gender_choice = st.radio(
+    "👤 請先選擇性別（影響 BMI 計算精準度）：",
+    ["♀️ 女性 (Female)", "♂️ 男性 (Male)"],
+    horizontal=True
+)
+gender_val  = 0.0 if "女性" in gender_choice else 1.0
+gender_label = "Female (女性)" if gender_val == 0.0 else "Male (男性)"
 
 input_mode = st.radio(
     "👉 請選擇輸入方式：",
@@ -255,19 +231,18 @@ input_mode = st.radio(
 )
 
 target_image = None
-
 if input_mode == "📤 上傳本機照片":
     target_image = st.file_uploader(
         "選擇本機相簿中的正臉半身照片",
         type=["jpg", "jpeg", "png"],
-        key="bmi_uploader_v2"
+        key="bmi_uploader_v3"
     )
 else:
     target_image = st.camera_input("請將正臉與肩膀對齊畫面中央進行拍攝")
 
 st.write("---")
 
-# --- 9. 畫面渲染 ---
+# --- 9. 渲染 ---
 col_left, col_right = st.columns([3, 2])
 
 if target_image is not None:
@@ -290,7 +265,7 @@ if target_image is not None:
     img_np = np.array(fixed_img)
 
     with st.spinner("🔍 5-Fold EfficientNet-B3 正在分析體態..."):
-        res_draw, res_gender, res_bmi, res_status = process_face_bmi(img_np)
+        res_draw, res_bmi, res_status = process_face_bmi(img_np, gender_val)
 
     with col_left:
         st.subheader("1. 臉部與對齊標記確認")
@@ -300,8 +275,8 @@ if target_image is not None:
     with col_right:
         st.subheader("2. AI 綜合分析結果")
 
-        st.subheader("📊 多數決預估性別")
-        st.info(f"**{res_gender}**")
+        st.subheader("📊 性別（使用者輸入）")
+        st.info(f"**{gender_label}**")
 
         st.subheader("🩺 體態評估狀態")
         st.info(f"**{res_status}**")
@@ -312,10 +287,10 @@ if target_image is not None:
 else:
     gc.collect()
     with col_left:
-        st.info("💡 請上傳照片或開啟鏡頭拍照，系統將自動啟動 5-Fold AI 交叉預估。")
+        st.info("💡 請先選擇性別，再上傳照片或開啟鏡頭拍照。")
     with col_right:
-        st.text_input("📊 多數決預估性別", value="等待輸入...", disabled=True, key="dis_gender_v2")
-        st.text_input("🩺 體態評估狀態",   value="等待輸入...", disabled=True, key="dis_status_v2")
+        st.text_input("📊 性別（使用者輸入）", value="等待輸入...", disabled=True, key="dis_gender_v3")
+        st.text_input("🩺 體態評估狀態",       value="等待輸入...", disabled=True, key="dis_status_v3")
         st.subheader("🎯 5-Fold 平均 BMI 值")
         st.metric(label="Ensemble Average BMI", value="0.00")
 
