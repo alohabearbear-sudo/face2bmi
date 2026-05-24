@@ -1,6 +1,5 @@
 import os
 import gc
-import sys
 import traceback
 import cv2
 import numpy as np
@@ -9,7 +8,7 @@ import streamlit as st
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
-from torchvision.models import resnet18
+import timm
 from PIL import Image, ImageOps
 from collections import Counter
 
@@ -20,7 +19,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# --- 1. 設定 5-Fold 正式發佈下載網址與本地路徑 ---
+# --- 1. 設定 5-Fold 下載網址與本地路徑 ---
 WEIGHTS_DIR = "weights"
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 
@@ -29,14 +28,67 @@ MODEL_URLS = {
     2: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold2_best.pth",
     3: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold3_best.pth",
     4: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold4_best.pth",
-    5: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold5_best.pth"
+    5: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold5_best.pth",
 }
 
 FOLD_PATHS = [os.path.join(WEIGHTS_DIR, f"fold{i}_best.pth") for i in range(1, 6)]
 
-# --- 免密鑰直連下載函數 ---
+# --- 訓練時 BMI 標準化參數（反歸一化用）---
+BMI_MEAN = 24.5
+BMI_STD  = 4.5
+
+
+# --- 2. 正確的模型架構（對應 state_dict）---
+class FaceBMIModel(nn.Module):
+    """
+    Backbone : EfficientNet-B3 (timm) → 1536-dim feature
+    meta_encoder : gender scalar (0/1) → 64-dim
+    bmi_head    : [1536 + 64 = 1600] → 512 → 256 → 1  (BMI regression)
+    gender_head : [1536] → 128 → 1  (gender binary logit)
+    """
+    def __init__(self):
+        super().__init__()
+        self.backbone = timm.create_model(
+            'efficientnet_b3', pretrained=False,
+            num_classes=0, global_pool='avg'
+        )
+        self.meta_encoder = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 64),
+        )
+        self.bmi_head = nn.Sequential(
+            nn.Linear(1600, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 1),
+        )
+        self.gender_head = nn.Sequential(
+            nn.Linear(1536, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x, meta):
+        feat        = self.backbone(x)                          # [B, 1536]
+        meta_feat   = self.meta_encoder(meta)                   # [B, 64]
+        combined    = torch.cat([feat, meta_feat], dim=1)       # [B, 1600]
+        bmi_norm    = self.bmi_head(combined)                   # [B, 1]
+        gender_logit = self.gender_head(feat)                   # [B, 1]
+        return bmi_norm, gender_logit
+
+
+# --- 3. 下載權重 ---
 def download_public_weights(fold_num):
-    local_path = os.path.join(WEIGHTS_DIR, f"fold{fold_num}_best.pth")
+    local_path = FOLD_PATHS[fold_num - 1]
     if not os.path.exists(local_path):
         with st.spinner(f"⏳ 正在從雲端下載 Fold {fold_num} 權重檔案..."):
             response = requests.get(MODEL_URLS[fold_num], stream=True)
@@ -45,10 +97,11 @@ def download_public_weights(fold_num):
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
             else:
-                st.error(f"❌ Fold {fold_num} 下載失敗。狀態碼: {response.status_code}。")
+                st.error(f"❌ Fold {fold_num} 下載失敗。狀態碼: {response.status_code}")
                 st.stop()
 
-# --- 全域模型快取清單 ---
+
+# --- 4. 全域模型快取 ---
 _models_ensemble = []
 
 def get_ensemble_models():
@@ -56,120 +109,134 @@ def get_ensemble_models():
     if not _models_ensemble:
         for i in range(1, 6):
             download_public_weights(i)
-            
-        with st.spinner("⏳ 正在進行 5-Fold 記憶體矩rix對齊..."):
-            loaded_models = []
+
+        with st.spinner("⏳ 載入 5-Fold EfficientNet-B3 Ensemble..."):
+            loaded = []
             for path in FOLD_PATHS:
-                model = resnet18(pretrained=False)
-                model.fc = nn.Linear(model.fc.in_features, 1)
-                
+                model = FaceBMIModel()
                 try:
-                    state_dict = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
+                    state_dict = torch.load(path, map_location='cpu', weights_only=False)
                 except Exception:
-                    state_dict = torch.load(path, map_location=torch.device('cpu'))
-                    
-                model.load_state_dict(state_dict, strict=False)
+                    state_dict = torch.load(path, map_location='cpu')
+                model.load_state_dict(state_dict, strict=True)   # strict=True 確保完整載入
                 model.eval()
-                loaded_models.append(model)
-                
-            _models_ensemble = loaded_models
+                loaded.append(model)
+            _models_ensemble = loaded
     return _models_ensemble
 
-# 影像預處理流程
+
+# --- 5. 影像預處理 ---
 img_transforms = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std =[0.229, 0.224, 0.225]),
 ])
 
-# --- 2. 核心整合預測邏輯 ---
+
+# --- 6. 核心推理邏輯 ---
 def process_face_bmi(img_np):
     if img_np is None:
         return None, "等待輸入...", 0.0, "等待輸入..."
 
     h, w = img_np.shape[:2]
     draw_img = img_np.copy()
-    
-    cx, cy = int(w * 0.5), int(h * 0.45)
-    color = (0, 255, 255) 
+
+    # 繪製對齊虛線框（與原版相同）
+    cx, cy    = int(w * 0.5), int(h * 0.45)
+    color     = (0, 255, 255)
     thickness = max(2, int(w * 0.005))
 
     def draw_dashed_ellipse(img, center, axes, start_angle, end_angle, gap_deg=6):
         for a in range(start_angle, end_angle, gap_deg * 2):
-            cv2.ellipse(img, center, axes, 0, a, min(a + gap_deg, end_angle), color, thickness)
+            cv2.ellipse(img, center, axes, 0, a,
+                        min(a + gap_deg, end_angle), color, thickness)
 
     def draw_dashed_line(img, pt1, pt2, gap=12):
         dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
-        if dist == 0: return  
+        if dist == 0:
+            return
         pts = np.linspace(pt1, pt2, max(2, int(dist / gap)))
         for i in range(0, len(pts) - 1, 2):
-            cv2.line(img, tuple(pts[i].astype(int)), tuple(pts[i+1].astype(int)), color, thickness)
+            cv2.line(img, tuple(pts[i].astype(int)),
+                     tuple(pts[i + 1].astype(int)), color, thickness)
 
-    # 繪製對齊虛線框
-    head_axes = (int(w * 0.15), int(h * 0.2))
+    head_axes  = (int(w * 0.15), int(h * 0.2))
     draw_dashed_ellipse(draw_img, (cx, cy - int(h * 0.05)), head_axes, 0, 360)
-    draw_dashed_line(draw_img, (cx - int(w * 0.05), cy + int(h * 0.15)), (cx - int(w * 0.05), cy + int(h * 0.2)), gap=8)
-    draw_dashed_line(draw_img, (cx + int(w * 0.05), cy + int(h * 0.15)), (cx + int(w * 0.05), cy + int(h * 0.2)), gap=8)
-    
+    draw_dashed_line(draw_img,
+                     (cx - int(w * 0.05), cy + int(h * 0.15)),
+                     (cx - int(w * 0.05), cy + int(h * 0.2)), gap=8)
+    draw_dashed_line(draw_img,
+                     (cx + int(w * 0.05), cy + int(h * 0.15)),
+                     (cx + int(w * 0.05), cy + int(h * 0.2)), gap=8)
+
     shoulder_y = cy + int(h * 0.2)
-    draw_dashed_ellipse(draw_img, (cx - int(w * 0.22), shoulder_y + int(h * 0.1)), (int(w * 0.18), int(h * 0.1)), 270, 360, gap_deg=4)
-    draw_dashed_ellipse(draw_img, (cx + int(w * 0.22), shoulder_y + int(h * 0.1)), (int(w * 0.18), int(h * 0.1)), 180, 270, gap_deg=4)
-    draw_dashed_line(draw_img, (cx - int(w * 0.22), shoulder_y + int(h * 0.1)), (cx - int(w * 0.22), h))
-    draw_dashed_line(draw_img, (cx + int(w * 0.22), shoulder_y + int(h * 0.1)), (cx + int(w * 0.22), h))
+    draw_dashed_ellipse(draw_img,
+                        (cx - int(w * 0.22), shoulder_y + int(h * 0.1)),
+                        (int(w * 0.18), int(h * 0.1)), 270, 360, gap_deg=4)
+    draw_dashed_ellipse(draw_img,
+                        (cx + int(w * 0.22), shoulder_y + int(h * 0.1)),
+                        (int(w * 0.18), int(h * 0.1)), 180, 270, gap_deg=4)
+    draw_dashed_line(draw_img,
+                     (cx - int(w * 0.22), shoulder_y + int(h * 0.1)),
+                     (cx - int(w * 0.22), h))
+    draw_dashed_line(draw_img,
+                     (cx + int(w * 0.22), shoulder_y + int(h * 0.1)),
+                     (cx + int(w * 0.22), h))
 
     try:
         models = get_ensemble_models()
-        
-        # 修正 OpenCV 與 PIL 通道轉換
-        pil_img = Image.fromarray(cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)).convert('RGB')
-        img_tensor = img_transforms(pil_img)
-        img_tensor = img_tensor.unsqueeze(0)  
-        
-        bmi_outputs = []
-        gender_votes = []
-        
+        pil_img   = Image.fromarray(img_np).convert('RGB')
+        img_tensor = img_transforms(pil_img).unsqueeze(0)  # [1, 3, 224, 224]
+
+        bmi_raw_list    = []
+        gender_prob_list = []
+
         with torch.no_grad():
+            # --- 第一輪：用 meta=0.0 取得 gender logit ---
+            meta_neutral = torch.tensor([[0.0]])
             for model in models:
-                output = model(img_tensor)
-                fold_bmi = float(output.item())
-                
-                # ✨ 核心修正點：如果模型輸出的是標準未平移數據，將負值或歸一化值自動對齊真實醫療基準
-                if fold_bmi <= 0 or fold_bmi < 5:
-                    fold_bmi = abs(fold_bmi) * 10 + 20
-                if fold_bmi > 60:
-                    fold_bmi = fold_bmi / 10.0
-                    
-                bmi_outputs.append(fold_bmi)
-                
-                # ✨ 修正性別判定基準邏輯 (配合回歸輸出對齊)
-                fold_gender = "Male (男性)" if fold_bmi > 23.8 else "Female (女性)"
-                gender_votes.append(fold_gender)
-        
-        # 計算 5 摺平均
-        bmi_val = float(np.mean(bmi_outputs))
-        vote_counts = Counter(gender_votes)
-        gender_res = vote_counts.most_common(1)[0][0]
-            
+                _, gender_logit = model(img_tensor, meta_neutral)
+                gender_prob_list.append(torch.sigmoid(gender_logit).item())
+
+            # --- 決定性別（多數決）---
+            # sigmoid >= 0.5 → Male(1), < 0.5 → Female(0)
+            gender_votes = [1 if p >= 0.5 else 0 for p in gender_prob_list]
+            gender_val   = float(Counter(gender_votes).most_common(1)[0][0])
+            gender_res   = "Male (男性)" if gender_val == 1.0 else "Female (女性)"
+
+            # --- 第二輪：用確定的 gender 值取得精準 BMI ---
+            meta_final = torch.tensor([[gender_val]])
+            for model in models:
+                bmi_norm, _ = model(img_tensor, meta_final)
+                bmi_raw_list.append(bmi_norm.item())
+
+        # --- 反歸一化：BMI_real = raw * std + mean ---
+        bmi_val = float(np.mean(bmi_raw_list)) * BMI_STD + BMI_MEAN
+        # 合理範圍夾緊
+        bmi_val = float(np.clip(bmi_val, 10.0, 60.0))
+
         if bmi_val < 18.5:
             status_res = "🔵 體重過輕"
-        elif 18.5 <= bmi_val < 24:
+        elif bmi_val < 24.0:
             status_res = "🟢 健康體態"
-        elif 24 <= bmi_val < 27:
+        elif bmi_val < 27.0:
             status_res = "🟡 輕度過重"
         else:
             status_res = "🔴 肥胖體態"
 
     except Exception as e:
-        bmi_val = -1.0
+        bmi_val    = -1.0
         gender_res = "Error"
         status_res = f"❌ 核心辨識異常: {str(e)}"
-        st.error(f"🚨 模型運算發生錯誤日誌: \n {traceback.format_exc()}")
+        st.error(f"🚨 模型運算發生錯誤：\n{traceback.format_exc()}")
     finally:
         gc.collect()
 
     return draw_img, gender_res, bmi_val, status_res
 
-# --- 3. 前端 CSS 風格 ---
+
+# --- 7. 前端 CSS ---
 st.markdown("""
 <style>
     .stMarkdown h1 { color: #2E7D32; text-align: center; font-weight: bold; }
@@ -177,11 +244,15 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 4. 建立 UI 介面 ---
+# --- 8. UI 介面（與原版相同）---
 st.markdown("# 🧑‍⚕️ AI 臉部即時 BMI & 性別估算系統 by Jimmy Chen")
-st.markdown("### 🎯 5-Fold 交叉驗證 Ensemble 統合（官方網路直連版）")
+st.markdown("### 🎯 5-Fold 交叉驗證 Ensemble 統合（EfficientNet-B3 雙輸出頭版）")
 
-input_mode = st.radio("👉 請選擇輸入方式：", ["📤 上傳本機照片", "📸 開啟鏡頭拍照"], horizontal=True)
+input_mode = st.radio(
+    "👉 請選擇輸入方式：",
+    ["📤 上傳本機照片", "📸 開啟鏡頭拍照"],
+    horizontal=True
+)
 
 target_image = None
 
@@ -189,14 +260,14 @@ if input_mode == "📤 上傳本機照片":
     target_image = st.file_uploader(
         "選擇本機相簿中的正臉半身照片",
         type=["jpg", "jpeg", "png"],
-        key="bmi_uploader_final_v5"
+        key="bmi_uploader_v2"
     )
 else:
     target_image = st.camera_input("請將正臉與肩膀對齊畫面中央進行拍攝")
 
 st.write("---")
 
-# --- 5. 畫面渲染 ---
+# --- 9. 畫面渲染 ---
 col_left, col_right = st.columns([3, 2])
 
 if target_image is not None:
@@ -218,7 +289,7 @@ if target_image is not None:
 
     img_np = np.array(fixed_img)
 
-    with st.spinner("🔍 5-Fold AI 正在綜合提取特徵與體態評估..."):
+    with st.spinner("🔍 5-Fold EfficientNet-B3 正在分析體態..."):
         res_draw, res_gender, res_bmi, res_status = process_face_bmi(img_np)
 
     with col_left:
@@ -228,25 +299,28 @@ if target_image is not None:
 
     with col_right:
         st.subheader("2. AI 綜合分析結果")
-        
+
         st.subheader("📊 多數決預估性別")
         st.info(f"**{res_gender}**")
-        
+
         st.subheader("🩺 體態評估狀態")
         st.info(f"**{res_status}**")
-        
+
         st.subheader("🎯 5-Fold 平均 BMI 值")
-        # ✨ 解鎖渲染：不管正負數，強行打印真實計算值
         st.metric(label="Ensemble Average BMI", value=f"{res_bmi:.2f}")
+
 else:
     gc.collect()
     with col_left:
         st.info("💡 請上傳照片或開啟鏡頭拍照，系統將自動啟動 5-Fold AI 交叉預估。")
     with col_right:
-        st.text_input("📊 多數決預估性別", value="等待輸入...", disabled=True, key="dis_gender_final_v5")
-        st.text_input("🩺 體態評估狀態", value="等待輸入...", disabled=True, key="dis_status_final_v5")
+        st.text_input("📊 多數決預估性別", value="等待輸入...", disabled=True, key="dis_gender_v2")
+        st.text_input("🩺 體態評估狀態",   value="等待輸入...", disabled=True, key="dis_status_v2")
         st.subheader("🎯 5-Fold 平均 BMI 值")
         st.metric(label="Ensemble Average BMI", value="0.00")
 
 st.markdown("---")
-st.markdown("<center>Developed by Jimmy Chen | 2026 Medical AI Track Edition</center>", unsafe_allow_html=True)
+st.markdown(
+    "<center>Developed by Jimmy Chen | 2026 Medical AI Track Edition</center>",
+    unsafe_allow_html=True
+)
