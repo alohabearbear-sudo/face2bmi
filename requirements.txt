@@ -1,5 +1,6 @@
 streamlit
 streamlit_webrtc
+timm
 torch
 torchvision
 opencv-python-headless
