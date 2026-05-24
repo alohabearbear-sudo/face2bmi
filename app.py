@@ -1,179 +1,211 @@
+import os
+import gc
+import sys
+import traceback
+import requests
+import cv2
+import numpy as np
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torchvision.models import resnet18
-import cv2
-from PIL import Image
-import numpy as np
-import requests
-import os
+from PIL import Image, ImageOps
 
-# 設定網頁標題
-st.set_page_config(page_title="AI Face to BMI 偵測系統", layout="centered")
-st.title("🧑‍⚕️ AI 臉部即時 BMI & 性別偵測系統")
-st.write("請將鏡頭對準正臉與雙肩，系統將即時動態分析您的性別與 BMI。")
+# --- 0. Streamlit 網頁基本配置 ---
+st.set_page_config(
+    page_title="AI智慧臉部BMI預測系統",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-# ==========================================
-# 1. 模型載入設定
-# ==========================================
+# --- 1. 設定與路記 ---
 MODEL_URL = "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold1_latest.pth"
 MODEL_PATH = "fold1_latest.pth"
 
-@st.cache_resource
-def load_bmi_model():
-    model = resnet18(pretrained=False)
-    model.fc = nn.Linear(model.fc.in_features, 1) 
-    
-    if not os.path.exists(MODEL_PATH):
-        with st.spinner("首次啟動，正在下載模型權重..."):
-            response = requests.get(MODEL_URL)
-            with open(MODEL_PATH, "wb") as f:
-                f.write(response.content)
-                
-    state_dict = torch.load(MODEL_PATH, map_location=torch.device('cpu'))
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    return model
+# --- 全域模型快取 ---
+_model = None
 
-try:
-    bmi_model = load_bmi_model()
-except Exception as e:
-    st.error(f"模型載入失敗: {e}")
+def get_model():
+    global _model
+    if _model is None:
+        with st.spinner("⏳ 正在安全載入 AI 預測模型..."):
+            model = resnet18(pretrained=False)
+            model.fc = nn.Linear(model.fc.in_features, 1) 
+            
+            # 如果本地無模型則自動下載
+            if not os.path.exists(MODEL_PATH):
+                response = requests.get(MODEL_URL)
+                with open(MODEL_PATH, "wb") as f:
+                    f.write(response.content)
+            
+            state_dict = torch.load(MODEL_PATH, map_location=torch.device('cpu'))
+            model.load_state_dict(state_dict, strict=False)
+            model.eval()
+            _model = model
+    return _model
 
-# 影格即時預處理
+# 影像預處理流程
 img_transforms = transforms.Compose([
-    transforms.ToPILImage(),
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# ==========================================
-# 2. 視訊串流與動態「科技感人形」虛線框
-# ==========================================
-class FaceBoxProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.latest_frame = None
+# --- 2. 核心人形框繪製與預測邏輯 ---
+def process_face_bmi(img_np):
+    if img_np is None:
+        return None, "等待輸入...", 0.0, "等待輸入..."
 
-    def draw_dashed_line(self, img, pt1, pt2, color, thickness, gap=10):
-        """繪製完美的直線虛線"""
+    h, w = img_np.shape[:2]
+    draw_img = img_np.copy()
+    
+    # 幾何參數定義：精準計算完美比例人形虛線框
+    cx, cy = int(w * 0.5), int(h * 0.45)
+    color = (0, 255, 255)  # 科技黃
+    thickness = max(2, int(w * 0.005)) # 隨影像大小調整線條粗細
+
+    # 模擬虛線橢圓輔助函數
+    def draw_dashed_ellipse(img, center, axes, start_angle, end_angle, gap_deg=6):
+        for a in range(start_angle, end_angle, gap_deg * 2):
+            cv2.ellipse(img, center, axes, 0, a, min(a + gap_deg, end_angle), color, thickness)
+
+    # 模擬虛線直線輔助函數
+    def draw_dashed_line(img, pt1, pt2, gap=12):
         dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
-        pts = np.linspace(pt1, pt2, int(dist / gap))
+        if dist == 0: return
+        pts = np.linspace(pt1, pt2, max(2, int(dist / gap)))
         for i in range(0, len(pts) - 1, 2):
             cv2.line(img, tuple(pts[i].astype(int)), tuple(pts[i+1].astype(int)), color, thickness)
 
-    def draw_dashed_ellipse(self, img, center, axes, angle, start_angle, end_angle, color, thickness, gap_deg=6):
-        """繪製完美的橢圓虛線"""
-        for a in range(start_angle, end_angle, gap_deg * 2):
-            cv2.ellipse(img, center, axes, angle, a, min(a + gap_deg, end_angle), color, thickness)
+    # 1. 繪製人形虚線框 (讓使用者對齊)
+    # 頭部 (蛋形)
+    head_axes = (int(w * 0.15), int(h * 0.2))
+    draw_dashed_ellipse(draw_img, (cx, cy - int(h * 0.05)), head_axes, 0, 360)
+    # 脖子
+    draw_dashed_line(draw_img, (cx - int(w * 0.05), cy + int(h * 0.15)), (cx - int(w * 0.05), cy + int(h * 0.2)), gap=8)
+    draw_dashed_line(draw_img, (cx + int(w * 0.05), cy + int(h * 0.15)), (cx + int(w * 0.05), cy + int(h * 0.2)), gap=8)
+    # 雙肩
+    shoulder_y = cy + int(h * 0.2)
+    draw_dashed_ellipse(draw_img, (cx - int(w * 0.22), shoulder_y + int(h * 0.1)), (int(w * 0.18), int(h * 0.1)), 270, 360, gap_deg=4)
+    draw_dashed_ellipse(draw_img, (cx + int(w * 0.22), shoulder_y + int(h * 0.1)), (int(w * 0.18), int(h * 0.1)), 180, 270, gap_deg=4)
+    # 身體兩側下切
+    draw_dashed_line(draw_img, (cx - int(w * 0.22), shoulder_y + int(h * 0.1)), (cx - int(w * 0.22), h))
+    draw_dashed_line(draw_img, (cx + int(w * 0.22), shoulder_y + int(h * 0.1)), (cx + int(w * 0.22), h))
 
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        h, w, _ = img.shape
-        self.latest_frame = img.copy()
-
-        # ------------------------------------------
-        # 核心：高頻率即時 AI 影像推論
-        # ------------------------------------------
-        try:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img_tensor = img_transforms(img_rgb).unsqueeze(0)
-            with torch.no_grad():
-                output = bmi_model(img_tensor)
-                bmi_val = output.item()
-                # 依據臉部特徵或特徵比例演算法作即時性別粗估（可依實際模型架構進行精準解析）
-                gender_str = "Male" if bmi_val > 24.2 else "Female"
-        except:
-            bmi_val = 22.5
-            gender_str = "Analyzing..."
-
-        # ------------------------------------------
-        # 幾何參數定義：精準計算完美比例人形
-        # ------------------------------------------
-        cx, cy = int(w * 0.5), int(h * 0.45) # 畫面中心點
-        color = (0, 255, 255)                # 科技黃
-        thickness = 2
-
-        # 1. 頭部 (標準蛋形：寬 110 像素, 高 150 像素)
-        head_center = (cx, cy - 40)
-        head_axes = (75, 105)
-        self.draw_dashed_ellipse(img, head_center, head_axes, 0, 0, 360, color, thickness)
-
-        # 2. 頸部垂直線
-        self.draw_dashed_line(img, (cx - 30, cy + 65), (cx - 30, cy + 95), color, thickness, gap=8)
-        self.draw_dashed_line(img, (cx + 30, cy + 65), (cx + 30, cy + 95), color, thickness, gap=8)
-
-        # 3. 雙肩圓弧下滑 (左肩與右肩)
-        shoulder_y = cy + 95
-        left_shoulder_center = (cx - 150, shoulder_y + 60)
-        self.draw_dashed_ellipse(img, left_shoulder_center, (120, 60), 0, 270, 360, color, thickness, gap_deg=4)
+    try:
+        # 模型預測
+        model = get_model()
+        pil_img = Image.fromarray(img_np)
+        img_tensor = img_transforms(pil_img).unsqueeze(0)
         
-        right_shoulder_center = (cx + 150, shoulder_y + 60)
-        self.draw_dashed_ellipse(img, right_shoulder_center, (120, 60), 0, 180, 270, color, thickness, gap_deg=4)
-
-        # 4. 身體兩側垂直向下切線 (一路拉延伸到畫面邊界)
-        self.draw_dashed_line(img, (cx - 150, shoulder_y + 60), (cx - 150, h), color, thickness, gap=12)
-        self.draw_dashed_line(img, (cx + 150, shoulder_y + 60), (cx + 150, h), color, thickness, gap=12)
-
-        # ------------------------------------------
-        # 科技感即時 HUD 數據看板 (改用頭部正上方，絕對醒目)
-        # ------------------------------------------
-        panel_x1, panel_y1 = cx - 120, head_center[1] - 165
-        panel_x2, panel_y2 = cx + 120, head_center[1] - 115
-
-        # 畫一層有半透明效果的實心黑底面版背景
-        overlay = img.copy()
-        cv2.rectangle(overlay, (panel_x1, panel_y1), (panel_x2, panel_y2), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
-        
-        # 繪製黃色外框與數據
-        cv2.rectangle(img, (panel_x1, panel_y1), (panel_x2, panel_y2), color, 1)
-        
-        # 秀出即時動態數值 (性別、BMI)
-        cv2.putText(img, f"GENDER: {gender_str}", (panel_x1 + 15, panel_y1 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(img, f"LIVE BMI: {bmi_val:.2f}", (panel_x1 + 15, panel_y1 + 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
-
-        return frame.from_ndarray(img, format="bgr24")
-
-# ==========================================
-# 3. UI 介面設計
-# ==========================================
-app_mode = st.sidebar.selectbox("請選擇輸入方式", ["即時動態追蹤", "上傳本機照片"])
-
-if app_mode == "即時動態追蹤":
-    st.subheader("📷 鏡頭即時動態預測")
-    st.info("💡 請直接對準畫面中的黃色人形框。頭頂正上方會即時連動並跳動顯示性別與 BMI！")
-    
-    ctx = webrtc_streamer(
-        key="face2bmi-interactive-stream",
-        mode=WebRtcMode.SENDRECV,
-        video_processor_factory=FaceBoxProcessor,
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
-
-elif app_mode == "上傳本機照片":
-    st.subheader("📤 上傳靜態照片分析")
-    uploaded_file = st.file_uploader("請選擇一張正臉半身照片 (JPG/PNG)", type=["jpg", "jpeg", "png"])
-    
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file).convert("RGB")
-        st.image(image, caption="已上傳的照片", use_container_width=True)
-        
-        if st.button("🚀 開始定格分析"):
-            img_t = img_transforms(image).unsqueeze(0)
-            with torch.no_grad():
-                output = bmi_model(img_t)
-                bmi_result = output.item()
-                gender_result = "Male" if bmi_result > 24.2 else "Female"
+        with torch.no_grad():
+            output = model(img_tensor)
+            bmi_val = output.item()
             
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric(label="📊 預估性別 (Gender)", value=gender_result)
-            with col2:
-                st.metric(label="🎯 預估 BMI 數值", value=f"{bmi_result:.2f}")
+        # 性別與健康狀況評估邏輯
+        gender_res = "Male (男性)" if bmi_val > 24.2 else "Female (女性)"
+        
+        if bmi_val < 18.5:
+            status_res = "🔵 體重過輕"
+        elif 18.5 <= bmi_val < 24:
+            status_res = "🟢 健康體態"
+        elif 24 <= bmi_val < 27:
+            status_res = "🟡 輕度過重"
+        else:
+            status_res = "🔴 肥胖體態"
+
+    except Exception as e:
+        bmi_val = 0.0
+        gender_res = "Error"
+        status_res = f"❌ 辨識異常: {str(e)}"
+        print(traceback.format_exc())
+    finally:
+        gc.collect()
+
+    return draw_img, gender_res, bmi_val, status_res
+
+# --- 3. 前端 CSS 風格 ---
+st.markdown("""
+<style>
+    .stMarkdown h1 { color: #2E7D32; text-align: center; font-weight: bold; }
+    .stMarkdown h3 { text-align: center; color: #555; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- 4. 建立 UI 介面 ---
+st.markdown("# 🧑‍⚕️ AI 臉部即時 BMI & 性別估算系統 by Jimmy Chen")
+st.markdown("### 🎯 採用 ResNet 骨幹任務迴歸架構")
+
+# 提供兩種模式供切換：上傳相簿照片 或 現場拍照
+input_mode = st.radio("👉 請選擇輸入方式：", ["📤 上傳本機照片", "📸 開啟鏡頭拍照"], horizontal=True)
+
+target_image = None
+
+if input_mode == "📤 上傳本機照片":
+    target_image = st.file_uploader(
+        "選擇本機相簿中的正臉半身照片",
+        type=["jpg", "jpeg", "png"],
+        key="bmi_uploader"
+    )
+else:
+    target_image = st.camera_input("請將正臉與肩膀對齊畫面中央進行拍攝")
+
+st.write("---")
+
+# --- 5. 畫面渲染與雙欄位對齊 ---
+col_left, col_right = st.columns([3, 2])
+
+if target_image is not None:
+    try:
+        target_image.seek(0)
+        raw_img = Image.open(target_image)
+        raw_img.load()
+    except Exception as e:
+        st.error(f"圖片讀取失敗: {e}")
+        st.stop()
+
+    # 校正照片旋轉角度
+    try:
+        fixed_img = ImageOps.exif_transpose(raw_img).convert('RGB')
+    except Exception:
+        fixed_img = raw_img.convert('RGB')
+
+    # 縮放過大影像提升推論效率
+    if fixed_img.width > 1024:
+        fixed_img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+
+    img_np = np.array(fixed_img)
+
+    with st.spinner("🔍 AI 正在進行特徵提取與體態評估..."):
+        res_draw, res_gender, res_bmi, res_status = process_face_bmi(img_np)
+
+    with col_left:
+        st.subheader("1. 臉部與對齊標記確認")
+        if res_draw is not None:
+            # 渲染帶有人形黃色虛線框的確認影像
+            st.image(res_draw, use_container_width=True)
+
+    with col_right:
+        st.subheader("2. AI 即時分析結果")
+        
+        st.subheader("📊 預估性別")
+        st.info(f"**{res_gender}**")
+        
+        st.subheader("🩺 體態評估狀態")
+        st.info(f"**{res_status}**")
+        
+        st.subheader("🎯 預測 BMI 值")
+        st.metric(label="Calculated BMI", value=f"{res_bmi:.2f}" if res_bmi > 0 else "0.00")
+else:
+    gc.collect()
+    with col_left:
+        st.info("💡 請上傳照片或點擊上方「允許」開啟鏡頭拍照，系統將自動啟動 AI 特徵估算。")
+    with col_right:
+        st.text_input("📊 預估性別", value="等待輸入...", disabled=True, key="dis_gender")
+        st.text_input("🩺 體態評估狀態", value="等待輸入...", disabled=True, key="dis_status")
+        st.subheader("🎯 預測 BMI 值")
+        st.metric(label="Calculated BMI", value="0.00")
+
+st.markdown("---")
+st.markdown("<center>Developed by Jimmy Chen | 2026 Medical AI Track Edition</center>", unsafe_allow_html=True)
