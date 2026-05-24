@@ -24,7 +24,6 @@ st.set_page_config(
 WEIGHTS_DIR = "weights"
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 
-# 完美對應你已經 Publish 成功的 v1 正式直連下載路徑
 MODEL_URLS = {
     1: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold1_best.pth",
     2: "https://github.com/alohabearbear-sudo/face2bmi/releases/download/v1/fold2_best.pth",
@@ -39,14 +38,14 @@ FOLD_PATHS = [os.path.join(WEIGHTS_DIR, f"fold{i}_best.pth") for i in range(1, 6
 def download_public_weights(fold_num):
     local_path = os.path.join(WEIGHTS_DIR, f"fold{fold_num}_best.pth")
     if not os.path.exists(local_path):
-        with st.spinner(f"⏳ 正在從公開雲端串流下載 Fold {fold_num} 權重..."):
+        with st.spinner(f"⏳ 正在從雲端下載 Fold {fold_num} 權重檔案..."):
             response = requests.get(MODEL_URLS[fold_num], stream=True)
             if response.status_code == 200:
                 with open(local_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
             else:
-                st.error(f"❌ Fold {fold_num} 下載失敗。狀態碼: {response.status_code}。請確認 GitHub Release 是否已被設為 Public（公開）！")
+                st.error(f"❌ Fold {fold_num} 下載失敗。狀態碼: {response.status_code}。")
                 st.stop()
 
 # --- 全域模型快取清單 ---
@@ -58,13 +57,18 @@ def get_ensemble_models():
         for i in range(1, 6):
             download_public_weights(i)
             
-        with st.spinner("⏳ 正在進行 5-Fold 記憶體矩陣對齊（僅在啟動時執行）..."):
+        with st.spinner("⏳ 正在進行 5-Fold 記憶體矩陣對齊..."):
             loaded_models = []
             for path in FOLD_PATHS:
                 model = resnet18(pretrained=False)
                 model.fc = nn.Linear(model.fc.in_features, 1)
                 
-                state_dict = torch.load(path, map_location=torch.device('cpu'))
+                # ✨ 關鍵安全降級載入：避免新舊版本 PyTorch 對齊封鎖
+                try:
+                    state_dict = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
+                except Exception:
+                    state_dict = torch.load(path, map_location=torch.device('cpu'))
+                    
                 model.load_state_dict(state_dict, strict=False)
                 model.eval()
                 loaded_models.append(model)
@@ -72,14 +76,14 @@ def get_ensemble_models():
             _models_ensemble = loaded_models
     return _models_ensemble
 
-# 影像預處理流程
+# 影像預處理流程 (確保與訓練時的 input size 及 normalization 完全契合)
 img_transforms = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# --- 2. 核心人形框與 5-Fold 整合預測邏輯 ---
+# --- 2. 核心整合預測邏輯 ---
 def process_face_bmi(img_np):
     if img_np is None:
         return None, "等待輸入...", 0.0, "等待輸入..."
@@ -88,7 +92,7 @@ def process_face_bmi(img_np):
     draw_img = img_np.copy()
     
     cx, cy = int(w * 0.5), int(h * 0.45)
-    color = (0, 255, 255)  # 科技黃/青色
+    color = (0, 255, 255) 
     thickness = max(2, int(w * 0.005))
 
     def draw_dashed_ellipse(img, center, axes, start_angle, end_angle, gap_deg=6):
@@ -97,12 +101,12 @@ def process_face_bmi(img_np):
 
     def draw_dashed_line(img, pt1, pt2, gap=12):
         dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
-        if dist == 0: return
+        if dist == Dist == 0: return
         pts = np.linspace(pt1, pt2, max(2, int(dist / gap)))
         for i in range(0, len(pts) - 1, 2):
             cv2.line(img, tuple(pts[i].astype(int)), tuple(pts[i+1].astype(int)), color, thickness)
 
-    # 繪製高精密對齊用人形虛線框
+    # 繪製對齊虛線框
     head_axes = (int(w * 0.15), int(h * 0.2))
     draw_dashed_ellipse(draw_img, (cx, cy - int(h * 0.05)), head_axes, 0, 360)
     draw_dashed_line(draw_img, (cx - int(w * 0.05), cy + int(h * 0.15)), (cx - int(w * 0.05), cy + int(h * 0.2)), gap=8)
@@ -117,10 +121,10 @@ def process_face_bmi(img_np):
     try:
         models = get_ensemble_models()
         
-        # 修正色彩通道並轉換成 PIL Image 進行標準推論
+        # 色彩通道校正
         pil_img = Image.fromarray(cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)).convert('RGB')
         img_tensor = img_transforms(pil_img)
-        img_tensor = img_tensor.unsqueeze(0)  # 擴展成 4 維 Tensor [1, 3, 224, 224]
+        img_tensor = img_tensor.unsqueeze(0)  
         
         bmi_outputs = []
         gender_votes = []
@@ -129,20 +133,13 @@ def process_face_bmi(img_np):
             for model in models:
                 output = model(img_tensor)
                 fold_bmi = float(output.item())
-                
-                # 預防數值極端異常校正
-                if fold_bmi < 0: 
-                    fold_bmi = abs(fold_bmi)
-                if fold_bmi < 10 or fold_bmi > 50: 
-                    fold_bmi = 22.0  
-                    
                 bmi_outputs.append(fold_bmi)
                 
-                # 性別投票投票基準
+                # 依據折預測結果投票
                 fold_gender = "Male (男性)" if fold_bmi > 24.2 else "Female (女性)"
                 gender_votes.append(fold_gender)
         
-        # 5折交叉平均與多數決統合
+        # 計算真實 5 折交叉平均值
         bmi_val = float(np.mean(bmi_outputs))
         vote_counts = Counter(gender_votes)
         gender_res = vote_counts.most_common(1)[0][0]
@@ -157,11 +154,11 @@ def process_face_bmi(img_np):
             status_res = "🔴 肥胖體態"
 
     except Exception as e:
+        # ✨ 如果出錯，直接把詳細報錯資訊噴在畫面上，不進行無聲隱藏！
         bmi_val = 0.0
         gender_res = "Error"
-        status_res = f"❌ 辨識異常: {str(e)}"
-        print("=== TRACEBACK ===")
-        print(traceback.format_exc())
+        status_res = f"❌ 核心辨識異常: {str(e)}"
+        st.error(f"🚨 模型運算發生錯誤日誌: \n {traceback.format_exc()}")
     finally:
         gc.collect()
 
@@ -177,7 +174,7 @@ st.markdown("""
 
 # --- 4. 建立 UI 介面 ---
 st.markdown("# 🧑‍⚕️ AI 臉部即時 BMI & 性別估算系統 by Jimmy Chen")
-st.markdown("### 🎯 5-Fold 交叉驗證 Ensemble 統合（網頁直連通車版）")
+st.markdown("### 🎯 5-Fold 交叉驗證 Ensemble 統合（官方網路直連版）")
 
 input_mode = st.radio("👉 請選擇輸入方式：", ["📤 上傳本機照片", "📸 開啟鏡頭拍照"], horizontal=True)
 
@@ -187,7 +184,7 @@ if input_mode == "📤 上傳本機照片":
     target_image = st.file_uploader(
         "選擇本機相簿中的正臉半身照片",
         type=["jpg", "jpeg", "png"],
-        key="bmi_uploader_final_v3"
+        key="bmi_uploader_final_v4"
     )
 else:
     target_image = st.camera_input("請將正臉與肩膀對齊畫面中央進行拍攝")
@@ -240,8 +237,8 @@ else:
     with col_left:
         st.info("💡 請上傳照片或開啟鏡頭拍照，系統將自動啟動 5-Fold AI 交叉預估。")
     with col_right:
-        st.text_input("📊 多數決預估性別", value="等待輸入...", disabled=True, key="dis_gender_final_v3")
-        st.text_input("🩺 體態評估狀態", value="等待輸入...", disabled=True, key="dis_status_final_v3")
+        st.text_input("📊 多數決預估性別", value="等待輸入...", disabled=True, key="dis_gender_final_v4")
+        st.text_input("🩺 體態評估狀態", value="等待輸入...", disabled=True, key="dis_status_final_v4")
         st.subheader("🎯 5-Fold 平均 BMI 值")
         st.metric(label="Ensemble Average BMI", value="0.00")
 
