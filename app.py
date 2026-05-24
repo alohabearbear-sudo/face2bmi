@@ -134,7 +134,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 4. 建立 UI 介面 ---
-st.markdown("# 🧑‍⚕️ AI 臉部即時 BMI & 性別估算系統 by Jimmy Chen")
+st.markdown("# 🧑‍⚕️ AI 顏值體重計 by Jimmy Chen")
 st.markdown("### 🎯 採用 ResNet 骨幹任務迴歸架構")
 
 # 提供兩種模式供切換：上傳相簿照片 或 現場拍照
