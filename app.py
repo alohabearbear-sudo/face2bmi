@@ -19,7 +19,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# --- 1. 下載設定 ---
+# --- 1. 設定 5-Fold 正式發佈下載網址與本地路徑 ---
 WEIGHTS_DIR = "weights"
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 
@@ -32,13 +32,20 @@ MODEL_URLS = {
 }
 FOLD_PATHS = [os.path.join(WEIGHTS_DIR, f"fold{i}_best.pth") for i in range(1, 6)]
 
-# 反歸一化參數（訓練時 meta 固定為 0.0，BN var≈0 已確認）
-BMI_MEAN = 24.5
-BMI_STD  = 4.5
+# 訓練時的 BMI 輸出範圍（sigmoid * (HIGH-LOW) + LOW）
+BMI_LOW  = 15.0
+BMI_HIGH = 40.0
 
 
-# --- 2. 正確模型架構（EfficientNet-B3 + 雙輸出頭）---
+# --- 2. 正確模型架構（完全對應訓練程式碼）---
 class FaceBMIModel(nn.Module):
+    """
+    訓練時架構（完全還原）：
+      backbone  : EfficientNet-B3 → 1536-dim feat
+      meta_encoder : gender scalar (固定0.0) → 64-dim
+      bmi_head  : [1536+64=1600] → sigmoid → BMI (15~40)
+      gender_head : [1536] → logit（訓練資料不平衡，全猜Female，不使用）
+    """
     def __init__(self):
         super().__init__()
         self.backbone = timm.create_model(
@@ -46,24 +53,38 @@ class FaceBMIModel(nn.Module):
             num_classes=0, global_pool='avg'
         )
         self.meta_encoder = nn.Sequential(
-            nn.Linear(1, 64), nn.BatchNorm1d(64), nn.ReLU(),
-            nn.Dropout(0.3), nn.Linear(64, 64),
+            nn.Linear(1, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 64),
         )
         self.bmi_head = nn.Sequential(
-            nn.Linear(1600, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.4),
-            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(1600, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(256, 1),
         )
         self.gender_head = nn.Sequential(
-            nn.Linear(1536, 128), nn.ReLU(), nn.Dropout(0.3), nn.Linear(128, 1),
+            nn.Linear(1536, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1),
         )
 
     def forward(self, x, meta):
-        feat         = self.backbone(x)
-        meta_feat    = self.meta_encoder(meta)
-        bmi_norm     = self.bmi_head(torch.cat([feat, meta_feat], dim=1))
-        gender_logit = self.gender_head(feat)
-        return bmi_norm, gender_logit
+        feat    = self.backbone(x)
+        fused   = torch.cat([feat, self.meta_encoder(meta)], dim=1)
+        raw_bmi = self.bmi_head(fused).squeeze(1)
+        # 訓練時的 sigmoid 映射，輸出直接是真實 BMI（15~40）
+        bmi     = torch.sigmoid(raw_bmi) * (BMI_HIGH - BMI_LOW) + BMI_LOW
+        gender  = self.gender_head(feat).squeeze(1)
+        return bmi, gender
 
 
 # --- 3. 下載權重 ---
@@ -113,7 +134,7 @@ img_transforms = transforms.Compose([
 ])
 
 
-# --- 6. 核心推理 ---
+# --- 6. 核心推理邏輯 ---
 def process_face_bmi(img_np):
     if img_np is None:
         return None, "等待輸入...", 0.0, "等待輸入..."
@@ -165,46 +186,47 @@ def process_face_bmi(img_np):
         pil_img    = Image.fromarray(img_np).convert('RGB')
         img_tensor = img_transforms(pil_img).unsqueeze(0)
 
-        # meta 固定 0.0（訓練時 BN var≈0，meta_encoder 為常數路徑）
-        META      = torch.tensor([[0.0]])
-        bmi_raws  = []
+        # meta 固定 0.0：訓練時 BN running_var≈0，只接受此值
+        META         = torch.tensor([[0.0]])
+        bmi_list     = []
         gender_probs = []
 
         with torch.no_grad():
             for model in models:
-                bmi_norm, gender_logit = model(img_tensor, META)
-                bmi_raws.append(bmi_norm.item())
+                bmi_val, gender_logit = model(img_tensor, META)
+                bmi_list.append(bmi_val.item())
                 gender_probs.append(torch.sigmoid(gender_logit).item())
 
-        # BMI 反歸一化
-        bmi_val = float(np.mean(bmi_raws)) * BMI_STD + BMI_MEAN
-        bmi_val = float(np.clip(bmi_val, 10.0, 60.0))
+        # BMI：模型輸出即真實值（15~40），直接平均
+        bmi_result = float(np.mean(bmi_list))
+        bmi_result = float(np.clip(bmi_result, BMI_LOW, BMI_HIGH))
 
-        # 性別：sigmoid < 0.5 → Female，>= 0.5 → Male
-        avg_prob  = float(np.mean(gender_probs))
-        gender_res = "Male (男性)" if avg_prob >= 0.5 else "Female (女性)"
+        # 性別：多數決（注意：訓練資料不平衡導致模型偏向Female）
+        votes      = [1 if p >= 0.5 else 0 for p in gender_probs]
+        gender_val = Counter(votes).most_common(1)[0][0]
+        gender_res = "Male (男性)" if gender_val == 1 else "Female (女性)"
 
-        if bmi_val < 18.5:
+        if bmi_result < 18.5:
             status_res = "🔵 體重過輕"
-        elif bmi_val < 24.0:
+        elif bmi_result < 24.0:
             status_res = "🟢 健康體態"
-        elif bmi_val < 27.0:
+        elif bmi_result < 27.0:
             status_res = "🟡 輕度過重"
         else:
             status_res = "🔴 肥胖體態"
 
     except Exception as e:
-        bmi_val    = -1.0
+        bmi_result = -1.0
         gender_res = "Error"
         status_res = f"❌ 核心辨識異常: {str(e)}"
         st.error(f"🚨 模型運算錯誤：\n{traceback.format_exc()}")
     finally:
         gc.collect()
 
-    return draw_img, gender_res, bmi_val, status_res
+    return draw_img, gender_res, bmi_result, status_res
 
 
-# --- 7. CSS ---
+# --- 7. 前端 CSS 風格 ---
 st.markdown("""
 <style>
     .stMarkdown h1 { color: #2E7D32; text-align: center; font-weight: bold; }
@@ -212,7 +234,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 8. UI（與原版相同）---
+# --- 8. 建立 UI 介面 ---
 st.markdown("# 🧑‍⚕️ AI 臉部即時 BMI & 性別估算系統 by Jimmy Chen")
 st.markdown("### 🎯 5-Fold 交叉驗證 Ensemble 統合（官方網路直連版）")
 
@@ -227,14 +249,14 @@ if input_mode == "📤 上傳本機照片":
     target_image = st.file_uploader(
         "選擇本機相簿中的正臉半身照片",
         type=["jpg", "jpeg", "png"],
-        key="bmi_uploader_v4"
+        key="bmi_uploader_final_v5"
     )
 else:
     target_image = st.camera_input("請將正臉與肩膀對齊畫面中央進行拍攝")
 
 st.write("---")
 
-# --- 9. 渲染 ---
+# --- 9. 畫面渲染 ---
 col_left, col_right = st.columns([3, 2])
 
 if target_image is not None:
@@ -281,8 +303,8 @@ else:
     with col_left:
         st.info("💡 請上傳照片或開啟鏡頭拍照，系統將自動啟動 5-Fold AI 交叉預估。")
     with col_right:
-        st.text_input("📊 多數決預估性別", value="等待輸入...", disabled=True, key="dis_gender_v4")
-        st.text_input("🩺 體態評估狀態",   value="等待輸入...", disabled=True, key="dis_status_v4")
+        st.text_input("📊 多數決預估性別", value="等待輸入...", disabled=True, key="dis_gender_final_v5")
+        st.text_input("🩺 體態評估狀態",   value="等待輸入...", disabled=True, key="dis_status_final_v5")
         st.subheader("🎯 5-Fold 平均 BMI 值")
         st.metric(label="Ensemble Average BMI", value="0.00")
 
