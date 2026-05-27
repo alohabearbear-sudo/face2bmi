@@ -1,6 +1,8 @@
 [client]
 # 關鍵防禦：當程式噴錯時，隱藏詳細的程式碼路徑與錯誤細節，防止使用者看到你的後台結構
 showErrorDetails = false
+showSidebarNavigation = false
+showContextMenu = false
 
 # 終極防禦：直接將工具列設為 minimal，這會自動拔除右上角所有選單（包含 View app source）
 toolbarMode = "minimal"
